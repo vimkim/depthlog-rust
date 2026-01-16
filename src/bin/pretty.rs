@@ -1,45 +1,40 @@
-// logfmt2pretty.rs
+// logfmt2pretty.rs (colorized)
 //
 // Usage:
-//   cargo run --release < input.log
-// or:
-//   rustc logfmt2pretty.rs -O && ./logfmt2pretty < input.log
+//   rustc logfmt2pretty.rs -O -o depthlog_pretty
+//   ./depthlog_pretty < input.log
 //
-// Output example:
-//   16:13:50.091 [I] locator_sr.c:7252 |     xlocator_force: recdes length: 72, area_size: 88
+// Notes:
+// - Uses ANSI colors when stdout is a TTY, or when FORCE_COLOR=1.
+// - Disable colors with NO_COLOR=1.
+// - Levels colorized: I,W,E,D,T (and fallback).
+// - Function name colorized.
 
 use std::collections::HashMap;
-use std::io::{self, BufRead};
+use std::io::{self, BufRead, IsTerminal};
 
 fn main() {
     let stdin = io::stdin();
+    let stdout = io::stdout();
+    let use_color = should_use_color(&stdout);
+
     let mut out = String::new();
 
     for line in stdin.lock().lines() {
         let Ok(line) = line else { continue };
         let line = line.trim();
-        if line.is_empty() {
-            continue;
-        }
+        if line.is_empty() { continue; }
 
         let fields = match parse_logfmt(line) {
             Ok(m) => m,
-            Err(_) => continue, // or: eprintln!("failed to parse: {line}");
+            Err(_) => continue,
         };
 
         let ts = fields.get("ts").map(|s| s.as_str()).unwrap_or("");
         let time = format_time_hms_millis(ts).unwrap_or_else(|| "??:??:??.???".to_string());
 
         let level = fields.get("level").map(|s| s.as_str()).unwrap_or("");
-        let level_ch = match level {
-            "info" => 'I',
-            "warn" | "warning" => 'W',
-            "error" => 'E',
-            "debug" => 'D',
-            "trace" => 'T',
-            other if !other.is_empty() => other.chars().next().unwrap_or('?').to_ascii_uppercase(),
-            _ => '?',
-        };
+        let level_ch = map_level(level);
 
         let depth: usize = fields
             .get("depth")
@@ -51,28 +46,92 @@ fn main() {
         let func = fields.get("func").map(|s| s.as_str()).unwrap_or("?");
         let msg = fields.get("msg").map(|s| s.as_str()).unwrap_or("");
 
-        // Indentation: 4 spaces per depth level (tweak as desired).
         let indent = " ".repeat(depth.saturating_mul(4));
 
+        let lvl = if use_color {
+            color_level(level_ch)
+        } else {
+            level_ch.to_string()
+        };
+
+        let func_disp = if use_color {
+            color_func(func)
+        } else {
+            func.to_string()
+        };
+
         out.push_str(&format!(
-            "{time} [{level_ch}] {file}:{line_no} | {indent}{func}: {msg}\n"
+            "{time} [{lvl}] {file}:{line_no} | {indent}{func_disp}: {msg}\n"
         ));
     }
 
     print!("{out}");
 }
 
-/// Minimal logfmt parser:
-/// - key=value pairs separated by spaces
-/// - values may be quoted with "..."
-/// - supports escapes in quoted strings: \", \\ , \n , \t , \r
+fn should_use_color(stdout: &io::Stdout) -> bool {
+    // Respect NO_COLOR (https://no-color.org/)
+    if std::env::var_os("NO_COLOR").is_some() {
+        return false;
+    }
+    // Allow forcing
+    if let Ok(v) = std::env::var("FORCE_COLOR") {
+        if v != "0" && !v.is_empty() {
+            return true;
+        }
+    }
+    stdout.is_terminal()
+}
+
+fn map_level(level: &str) -> char {
+    match level {
+        "info" => 'I',
+        "warn" | "warning" => 'W',
+        "error" => 'E',
+        "debug" => 'D',
+        "trace" => 'T',
+        other if !other.is_empty() => other.chars().next().unwrap_or('?').to_ascii_uppercase(),
+        _ => '?',
+    }
+}
+
+// ---------- ANSI coloring helpers ----------
+
+const RESET: &str = "\x1b[0m";
+const BOLD: &str = "\x1b[1m";
+
+// Standard ANSI colors
+const RED: &str = "\x1b[31m";
+const GREEN: &str = "\x1b[32m";
+const YELLOW: &str = "\x1b[33m";
+const BLUE: &str = "\x1b[34m";
+const MAGENTA: &str = "\x1b[35m";
+const CYAN: &str = "\x1b[36m";
+const WHITE: &str = "\x1b[37m";
+
+fn color_level(ch: char) -> String {
+    match ch {
+        'E' => format!("{BOLD}{RED}{ch}{RESET}"),
+        'W' => format!("{BOLD}{YELLOW}{ch}{RESET}"),
+        'I' => format!("{BOLD}{GREEN}{ch}{RESET}"),
+        'D' => format!("{BOLD}{BLUE}{ch}{RESET}"),
+        'T' => format!("{BOLD}{MAGENTA}{ch}{RESET}"),
+        _ => format!("{BOLD}{WHITE}{ch}{RESET}"),
+    }
+}
+
+fn color_func(func: &str) -> String {
+    // Function name: bold cyan (adjust if desired)
+    format!("{BOLD}{CYAN}{func}{RESET}")
+}
+
+// ---------- logfmt parsing ----------
+
 fn parse_logfmt(input: &str) -> Result<HashMap<String, String>, ()> {
     let mut m = HashMap::new();
     let bytes = input.as_bytes();
     let mut i = 0;
 
     while i < bytes.len() {
-        // skip spaces
         while i < bytes.len() && bytes[i].is_ascii_whitespace() {
             i += 1;
         }
@@ -80,7 +139,6 @@ fn parse_logfmt(input: &str) -> Result<HashMap<String, String>, ()> {
             break;
         }
 
-        // parse key
         let key_start = i;
         while i < bytes.len() && bytes[i] != b'=' && !bytes[i].is_ascii_whitespace() {
             i += 1;
@@ -89,16 +147,15 @@ fn parse_logfmt(input: &str) -> Result<HashMap<String, String>, ()> {
             return Err(());
         }
         let key = &input[key_start..i];
-        i += 1; // skip '='
+        i += 1;
 
-        // parse value
         let val = if i < bytes.len() && bytes[i] == b'"' {
-            i += 1; // skip opening quote
+            i += 1;
             let mut v = String::new();
             while i < bytes.len() {
                 let c = bytes[i] as char;
                 if c == '"' {
-                    i += 1; // closing quote
+                    i += 1;
                     break;
                 }
                 if c == '\\' {
@@ -136,23 +193,16 @@ fn parse_logfmt(input: &str) -> Result<HashMap<String, String>, ()> {
     Ok(m)
 }
 
-/// Parses RFC3339 timestamps like "2026-01-16T16:13:50.091+09:00"
-/// and returns "16:13:50.091".
 fn format_time_hms_millis(ts: &str) -> Option<String> {
-    // Avoid extra deps; chrono is commonly used but not required if you compile with rustc only.
-    // We'll do a light parse: find 'T', then take up to timezone sign.
-    // Expected: YYYY-MM-DDTHH:MM:SS(.mmm)?(+|-)HH:MM or Z
     let t_pos = ts.find('T')?;
     let rest = &ts[t_pos + 1..];
 
-    // end at 'Z' or '+' or '-'
     let end = rest
         .find('Z')
         .or_else(|| rest.find('+'))
-        .or_else(|| rest.rfind('-'))?; // last '-' avoids the date dashes
+        .or_else(|| rest.rfind('-'))?;
 
-    let time_part = &rest[..end]; // "HH:MM:SS.091" or "HH:MM:SS"
-    // Normalize to milliseconds if missing
+    let time_part = &rest[..end];
     if let Some(dot) = time_part.find('.') {
         let (hms, frac) = time_part.split_at(dot);
         let frac = &frac[1..];
@@ -167,3 +217,4 @@ fn format_time_hms_millis(ts: &str) -> Option<String> {
         Some(format!("{time_part}.000"))
     }
 }
+
