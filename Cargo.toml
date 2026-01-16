@@ -1,0 +1,10 @@
+[package]
+name = "depthlog-rust"
+version = "0.1.0"
+edition = "2024"
+
+[[bin]]
+name = "depthlog_pretty"
+path = "src/bin/pretty.rs"
+
+[dependencies]
